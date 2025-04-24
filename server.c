@@ -26,7 +26,7 @@ typedef struct {
     AccessLevel level;
     char username[32];
     int authenticated;
-    CryptoContext crypto;
+    SecurityContext security_ctx; // Security context for encryption/decryption
 } ClientInfo;
 
 // Global variables
@@ -36,13 +36,11 @@ pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Function to authenticate user and return their access level
 int authenticate_user(const char* username, const char* password, AccessLevel* level) {
-    for (size_t i = 0; i < sizeof(users) / sizeof(users[0]); i++) {
-        if (strcmp(users[i].username, username) == 0) {
-            if (verify_password(password, users[i].password_hash)) {
-                *level = users[i].level;
-                return 1;
-            }
-            return 0;
+    for (int i = 0; i < sizeof(AUTHORIZED_USERS) / sizeof(AUTHORIZED_USERS[0]); i++) {
+        if (strcmp(username, AUTHORIZED_USERS[i].username) == 0 &&
+            verify_sha256_password(password, AUTHORIZED_USERS[i].password_hash)) {
+            *level = AUTHORIZED_USERS[i].level;
+            return 1;
         }
     }
     return 0;
@@ -50,23 +48,12 @@ int authenticate_user(const char* username, const char* password, AccessLevel* l
 
 // Handle client commands
 void handle_client_command(ClientInfo* client, const char* command, char* response) {
-    char cmd[16], arg1[BUFFER_SIZE], arg2[BUFFER_SIZE];
-    memset(cmd, 0, sizeof(cmd));
-    memset(arg1, 0, sizeof(arg1));
-    memset(arg2, 0, sizeof(arg2));
-    
-    // Extract command and arguments
-    int args = sscanf(command, "%15s %1023s %1023s", cmd, arg1, arg2);
-    
-    // Log the received command (only if it's not LIST which is too frequent)
-    if (strncmp(cmd, "LIST", 4) != 0) {
-        printf("[%s] User '%s' sent command: '%s'\n", 
-               get_current_time(), 
-               client->authenticated ? client->username : "unauthenticated", 
-               command);
-    }
-    
-    if (args < 1) {
+    char cmd[32], arg1[256], arg2[BUFFER_SIZE];
+    arg1[0] = arg2[0] = '\0';
+    memset(response, 0, BUFFER_SIZE);
+
+    // First get the command
+    if (sscanf(command, "%31s", cmd) != 1) {
         strcpy(response, "Invalid command format");
         return;
     }
@@ -109,47 +96,22 @@ void handle_client_command(ClientInfo* client, const char* command, char* respon
     }
 
     if (!client->authenticated) {
-        // Handle LOGIN command
-        if (strncmp(command, "LOGIN ", 6) == 0) {
-            char username[32], password[64];
-            if (sscanf(command + 6, "%31s %63s", username, password) == 2) {
-                if (client->authenticated) {
-                    strcpy(response, "Already logged in");
+        if (strcmp(cmd, "LOGIN") == 0) {
+            char username[32], password[32];
+            if (sscanf(command, "LOGIN %s %s", username, password) == 2) {
+                if (authenticate_user(username, password, &client->level)) {
+                    client->authenticated = 1;
+                    strncpy(client->username, username, sizeof(client->username)-1);
+                    client->level = client->level;
+                    strcpy(response, "Logged in successfully");
+                    sprintf(response + strlen(response), " as %s", username);
+                    printf("[%s] User '%s' logged in with %s access level\n", 
+                           get_current_time(), username, 
+                           client->level == TOP_LEVEL ? "TOP" : 
+                           client->level == MEDIUM_LEVEL ? "MEDIUM" : "ENTRY");
                 } else {
-                    AccessLevel level;
-                    if (authenticate_user(username, password, &level)) {
-                        // Initialize encryption
-                        if (!init_crypto(&client->crypto)) {
-                            strcpy(response, "Failed to initialize encryption");
-                        } else {
-                            client->authenticated = 1;
-                            client->level = level;
-                            strncpy(client->username, username, sizeof(client->username)-1);
-                            sprintf(response, "Logged in successfully as %s", username);
-                            printf("[%s] User '%s' logged in with level %d\n", 
-                                  get_current_time(), username, level);
-                            
-                            // Add a special marker to separate login response from keys
-                            char login_response[BUFFER_SIZE];
-                            snprintf(login_response, sizeof(login_response), "%s\n<KEY_MARKER>", response);
-                            send(client->socket, login_response, strlen(login_response), 0);
-                            
-                            // Send encryption keys after the marker
-                            if (send(client->socket, client->crypto.key, KEY_SIZE, 0) != KEY_SIZE ||
-                                send(client->socket, client->crypto.iv, IV_SIZE, 0) != IV_SIZE) {
-                                printf("Failed to send encryption keys to client\n");
-                            } else {
-                                printf("Encryption keys sent to client\n");
-                            }
-                            
-                            return; // Skip the normal response sending
-                        }
-                    } else {
-                        strcpy(response, "Invalid username or password");
-                    }
+                    strcpy(response, "Invalid credentials");
                 }
-            } else {
-                strcpy(response, "Usage: LOGIN <username> <password>");
             }
         } else {
             strcpy(response, "Please login first");
@@ -196,13 +158,23 @@ void handle_client_command(ClientInfo* client, const char* command, char* respon
         int result = handle_download_file(client->level, filepath, filedata, &filesize);
         if (result == FTP_SUCCESS) {
             strcpy(response, "Download starting");
-            send(client->socket, response, strlen(response), 0);
             
-            // Send file size
-            send(client->socket, &filesize, sizeof(filesize), 0);
+            // Encrypt the response
+            unsigned char encrypted_resp[BUFFER_SIZE];
+            int resp_len = strlen(response);
+            xor_encrypt_decrypt(&client->security_ctx, (unsigned char*)response, resp_len, encrypted_resp);
+            send(client->socket, encrypted_resp, resp_len, 0);
             
-            // Send file data
-            send(client->socket, filedata, filesize, 0);
+            // Encrypt and send file size
+            unsigned char encrypted_size[sizeof(filesize)];
+            xor_encrypt_decrypt(&client->security_ctx, (unsigned char*)&filesize, sizeof(filesize), encrypted_size);
+            send(client->socket, encrypted_size, sizeof(filesize), 0);
+            
+            // Encrypt and send file data
+            unsigned char* encrypted_data = malloc(filesize);
+            xor_encrypt_decrypt(&client->security_ctx, (unsigned char*)filedata, filesize, encrypted_data);
+            send(client->socket, encrypted_data, filesize, 0);
+            free(encrypted_data);
             
             printf("[%s] User '%s' downloaded file: %s\n", get_current_time(), client->username, arg1);
         } else {
@@ -223,18 +195,30 @@ void handle_client_command(ClientInfo* client, const char* command, char* respon
             snprintf(filepath, sizeof(filepath), "%s/%s", UPLOAD_DIR, arg1);
         }
         
-        // Receive file size
+        // Receive encrypted file size
         size_t filesize;
-        recv(client->socket, &filesize, sizeof(filesize), 0);
+        unsigned char encrypted_size[sizeof(filesize)];
+        recv(client->socket, encrypted_size, sizeof(filesize), 0);
         
-        // Receive file data
+        // Decrypt file size
+        xor_encrypt_decrypt(&client->security_ctx, encrypted_size, sizeof(filesize), (unsigned char*)&filesize);
+        
+        // Receive encrypted file data
+        unsigned char* encrypted_data = malloc(filesize);
         char* filedata = malloc(filesize);
         size_t received = 0;
         while (received < filesize) {
-            ssize_t n = recv(client->socket, filedata + received, filesize - received, 0);
+            ssize_t n = recv(client->socket, encrypted_data + received, filesize - received, 0);
             if (n <= 0) break;
             received += n;
         }
+        
+        // Decrypt file data if fully received
+        if (received == filesize) {
+            xor_encrypt_decrypt(&client->security_ctx, encrypted_data, filesize, (unsigned char*)filedata);
+        }
+        
+        free(encrypted_data);
         
         if (received == filesize) {
             int result = handle_upload_file(client->level, filepath, filedata, filesize);
@@ -422,108 +406,50 @@ void handle_client_command(ClientInfo* client, const char* command, char* respon
     }
 }
 
-// Function declaration
-void* handle_client(void* arg);
-
 // Handle client connection
 void* handle_client(void* arg) {
     ClientInfo* client = (ClientInfo*)arg;
-    char command[BUFFER_SIZE], response[BUFFER_SIZE];
-    unsigned char encrypted[BUFFER_SIZE], decrypted[BUFFER_SIZE];
+    char buffer[BUFFER_SIZE], response[BUFFER_SIZE];
+    unsigned char encrypted_buffer[BUFFER_SIZE], encrypted_response[BUFFER_SIZE];
     
     // Create uploads directory if it doesn't exist
     mkdir(UPLOAD_DIR, 0755);
-    mkdir("uploads/hash1", 0755);
-    mkdir("uploads/hash2", 0755);
-    mkdir("uploads/hash3", 0755);
+    
+    // First, receive the encryption key from client
+    recv(client->socket, client->security_ctx.key, KEY_SIZE, 0);
+    printf("Received encryption key from client\n");
 
     while (1) {
-        // Clear buffers for each new command
-        memset(command, 0, BUFFER_SIZE);
-        memset(response, 0, BUFFER_SIZE);
+        memset(buffer, 0, BUFFER_SIZE);
+        memset(encrypted_buffer, 0, BUFFER_SIZE);
         
-        // Receive command
-        if (client->authenticated) {
-            // Receive encrypted length
-            uint32_t encrypted_len;
-            if (recv(client->socket, &encrypted_len, sizeof(encrypted_len), 0) != sizeof(encrypted_len)) {
-                break;
-            }
-            encrypted_len = ntohl(encrypted_len);
-            
-            // Receive encrypted data
-            if (recv(client->socket, encrypted, encrypted_len, 0) != encrypted_len) {
-                break;
-            }
-            
-            // Initialize decryption for this operation
-            if (!EVP_DecryptInit_ex(client->crypto.ctx, EVP_aes_256_cbc(), NULL, 
-                                   client->crypto.key, client->crypto.iv)) {
-                break;
-            }
-            
-            // Decrypt received command
-            int decrypted_len;
-            if (!decrypt_data(&client->crypto, encrypted, encrypted_len, decrypted, &decrypted_len)) {
-                break;
-            }
-            decrypted[decrypted_len] = '\0';
-            strncpy(command, (char*)decrypted, BUFFER_SIZE-1);
-        } else {
-            // Before authentication, handle command as plaintext
-            ssize_t received = recv(client->socket, command, BUFFER_SIZE-1, 0);
-            if (received <= 0) {
-                break;
-            }
-            command[received] = '\0';
+        // Receive encrypted data
+        int bytes_received = recv(client->socket, encrypted_buffer, BUFFER_SIZE-1, 0);
+        
+        if (bytes_received <= 0) {
+            break;
         }
         
-        // Process the command and get response
-        handle_client_command(client, command, response);
+        // Decrypt the received data
+        xor_encrypt_decrypt(&client->security_ctx, encrypted_buffer, bytes_received, (unsigned char*)buffer);
         
-        // Send response
-        if (client->authenticated) {
-            // Initialize encryption for this operation
-            if (!EVP_EncryptInit_ex(client->crypto.ctx, EVP_aes_256_cbc(), NULL, 
-                                   client->crypto.key, client->crypto.iv)) {
-                break;
-            }
-            
-            // Encrypt response
-            int encrypted_len;
-            if (!encrypt_data(&client->crypto, (unsigned char*)response, strlen(response), 
-                            encrypted, &encrypted_len)) {
-                break;
-            }
-            
-            // Send encrypted length first
-            uint32_t len_network = htonl(encrypted_len);
-            if (send(client->socket, &len_network, sizeof(len_network), 0) < 0) {
-                break;
-            }
-            
-            // Send encrypted data
-            if (send(client->socket, encrypted, encrypted_len, 0) < 0) {
-                break;
-            }
-        } else {
-            if (send(client->socket, response, strlen(response), 0) < 0) {
-                break;
-            }
-        }
+        // Process the command
+        handle_client_command(client, buffer, response);
+        
+        // Encrypt the response
+        int response_len = strlen(response);
+        xor_encrypt_decrypt(&client->security_ctx, (unsigned char*)response, response_len, encrypted_response);
+        
+        // Send encrypted response
+        send(client->socket, encrypted_response, response_len, 0);
     }
-    
-    if (client->authenticated && client->crypto.ctx) {
-        EVP_CIPHER_CTX_free(client->crypto.ctx);
-    }
-    
+
     if (client->authenticated) {
         printf("[%s] User '%s' disconnected\n", get_current_time(), client->username);
     }
-    
     close(client->socket);
     free(client);
-    return NULL;
+    pthread_exit(NULL);
 }
 
 int main() {
